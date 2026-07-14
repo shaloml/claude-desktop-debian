@@ -25,9 +25,17 @@ readonly CACHE_DIR="$HOME/.cache/claude-desktop-debian/official"
 # Seconds to wait for a SIGTERM'd app to exit before escalating to KILL.
 readonly TERM_GRACE=15
 
+# The remote we only ever READ from: the project we forked. Nothing here
+# pushes to it, and sync_fork() refuses to run if the push target resolves
+# to the same repository.
+readonly UPSTREAM_REMOTE='origin'
+
 force=false
 dry_run=false
 skip_build=false
+skip_fork_sync=false
+fork_remote="${CLAUDE_FORK_REMOTE:-fork}"
+fork_sync_status='not attempted'
 project_root=''
 architecture=''
 installed_pkg=''
@@ -56,10 +64,15 @@ usage() {
 	cat << 'EOF'
 Usage: publish-desktop.sh [options]
 
-  --force       Rebuild and reinstall even when no newer version exists.
-  --skip-build  Reuse the .deb already present in the project root.
-  --dry-run     Print each step without changing anything.
-  -h, --help    Show this help.
+  --force            Rebuild and reinstall even when no newer version
+                     exists.
+  --skip-build       Reuse the .deb already present in the project root.
+  --no-fork-sync     Skip fast-forwarding the fork's default branch to
+                     upstream.
+  --fork-remote NAME Git remote of our fork (default: fork, or
+                     $CLAUDE_FORK_REMOTE).
+  --dry-run          Print each step without changing anything.
+  -h, --help         Show this help.
 EOF
 }
 
@@ -68,6 +81,13 @@ parse_args() {
 		case "$1" in
 			--force) force=true ;;
 			--skip-build) skip_build=true ;;
+			--no-fork-sync) skip_fork_sync=true ;;
+			--fork-remote)
+				[[ -n ${2:-} && $2 != -* ]] ||
+					die "Missing argument for $1"
+				fork_remote="$2"
+				shift
+				;;
 			--dry-run) dry_run=true ;;
 			-h|--help)
 				usage
@@ -429,6 +449,138 @@ install_new() {
 	log "Installed $PACKAGE_NAME $version."
 }
 
+#===============================================================================
+# Step 7: fast-forward our fork to upstream
+#===============================================================================
+
+# owner/repo for a git remote URL, https or ssh.
+remote_slug() {
+	local url="$1"
+
+	url="${url%.git}"
+	url="${url#*github.com[:/]}"
+	url="${url#*github.com}"
+	url="${url#[:/]}"
+	printf '%s\n' "$url"
+}
+
+# Everything that must hold before this script is allowed to push. The
+# whole point is that a clone can carry a remote for the project we forked
+# (this one does), and pushing a publish flow's output there would rewrite
+# someone else's repository.
+fork_push_allowed() {
+	local fork_url upstream_url is_fork
+
+	if [[ $fork_remote == "$UPSTREAM_REMOTE" ]]; then
+		warn "Refusing to push: --fork-remote is '$UPSTREAM_REMOTE'," \
+			'the upstream we only read from.'
+		return 1
+	fi
+
+	fork_url=$(git remote get-url "$fork_remote" 2>/dev/null)
+	if [[ -z $fork_url ]]; then
+		warn "No git remote named '$fork_remote'. Add our fork with:" \
+			$'\n    git remote add fork <url-of-your-fork>'
+		return 1
+	fi
+
+	# Same repository under a second remote name is still the upstream.
+	upstream_url=$(git remote get-url "$UPSTREAM_REMOTE" 2>/dev/null)
+	if [[ -n $upstream_url ]] &&
+		[[ $(remote_slug "$fork_url") == $(remote_slug "$upstream_url") ]]; then
+		warn "Refusing to push: '$fork_remote' resolves to the same" \
+			"repository as '$UPSTREAM_REMOTE' ($fork_url)."
+		return 1
+	fi
+
+	# Best-effort: if gh can see it, it must actually be a fork.
+	if command -v gh > /dev/null 2>&1; then
+		is_fork=$(gh repo view "$(remote_slug "$fork_url")" \
+			--json isFork --jq '.isFork' 2>/dev/null)
+		if [[ $is_fork == 'false' ]]; then
+			warn "Refusing to push: $(remote_slug "$fork_url") is not a" \
+				'fork.'
+			return 1
+		fi
+	fi
+}
+
+# Push upstream's default branch to the fork's, so the fork carries the
+# OFFICIAL_DEB_* pins for the release we just installed. No --force, ever:
+# a rejected push means the fork's branch has commits upstream lacks, and
+# that is a human's call, not a publish script's.
+sync_fork() {
+	local branch ref upstream_sha fork_sha
+
+	if [[ $skip_fork_sync == true ]]; then
+		fork_sync_status='skipped (--no-fork-sync)'
+		log 'Fork sync: skipped.'
+		return 0
+	fi
+
+	# Every git call below is repo-relative; --skip-build never cds.
+	cd "$project_root" || die "Cannot cd to $project_root"
+
+	if ! git rev-parse --git-dir > /dev/null 2>&1; then
+		warn "$project_root is not a git repo — skipping fork sync."
+		fork_sync_status='skipped (not a git repo)'
+		return 0
+	fi
+
+	if ! fork_push_allowed; then
+		fork_sync_status='skipped (no usable fork remote)'
+		return 0
+	fi
+
+	# Follow upstream's own default branch rather than assuming 'main'.
+	ref=$(git symbolic-ref "refs/remotes/$UPSTREAM_REMOTE/HEAD" 2>/dev/null)
+	branch="${ref##*/}"
+	branch="${branch:-main}"
+
+	git fetch -q "$UPSTREAM_REMOTE" "$branch" 2>/dev/null
+
+	upstream_sha=$(git rev-parse "refs/remotes/$UPSTREAM_REMOTE/$branch" \
+		2>/dev/null)
+	fork_sha=$(git ls-remote --heads "$fork_remote" "$branch" 2>/dev/null |
+		cut -f1)
+
+	if [[ -z $upstream_sha ]]; then
+		warn "Cannot resolve $UPSTREAM_REMOTE/$branch — skipping fork sync."
+		fork_sync_status='skipped (upstream branch not found)'
+		return 0
+	fi
+
+	if [[ $upstream_sha == "$fork_sha" ]]; then
+		fork_sync_status="already in sync (${upstream_sha:0:7})"
+		log "Fork sync: $fork_remote/$branch is already at" \
+			"${upstream_sha:0:7}."
+		return 0
+	fi
+
+	if [[ $dry_run == true ]]; then
+		log "[dry-run] Would push $UPSTREAM_REMOTE/$branch" \
+			"(${upstream_sha:0:7}) to $fork_remote/$branch"
+		fork_sync_status='dry-run'
+		return 0
+	fi
+
+	log "Fork sync: fast-forwarding $fork_remote/$branch to" \
+		"${upstream_sha:0:7}..."
+
+	if git push "$fork_remote" \
+		"refs/remotes/$UPSTREAM_REMOTE/$branch:refs/heads/$branch"; then
+		fork_sync_status="updated to ${upstream_sha:0:7}"
+		log "Fork sync: $fork_remote/$branch updated."
+		return 0
+	fi
+
+	# Non-fatal: the package is already installed, and a diverged fork is
+	# not something to paper over with --force.
+	warn "Fork sync failed — $fork_remote/$branch has probably diverged
+    from upstream. Reconcile it yourself; this script will not force-push."
+	fork_sync_status='FAILED (diverged?)'
+}
+
 main() {
 	parse_args "$@"
 	resolve_project_root
@@ -441,6 +593,7 @@ main() {
 	stop_running_app
 	uninstall_current
 	install_new
+	sync_fork
 
 	if [[ $dry_run == true ]]; then
 		log 'Dry run complete — nothing was changed.'
@@ -448,6 +601,7 @@ main() {
 	fi
 
 	log "Done. Claude Desktop $resolved_official_version is installed."
+	log "Fork: $fork_sync_status"
 	log "Launch it from your app menu or run: $PACKAGE_NAME"
 }
 

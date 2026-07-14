@@ -20,6 +20,7 @@ bash "$CLAUDE_PROJECT_DIR/.claude/skills/publish-desktop/publish-desktop.sh"
 | 4 | Stop every running Claude Desktop process (SIGTERM, then SIGKILL after 15s). |
 | 5 | `sudo apt-get remove -y` the installed package. |
 | 6 | `sudo apt-get install -y` the freshly built `.deb`, then verify it registered with dpkg. |
+| 7 | Fast-forward **our fork**'s default branch to upstream's, so the fork carries the `OFFICIAL_DEB_*` pins for the release just installed. |
 
 ## Your Task
 
@@ -42,10 +43,21 @@ user to run it from a real terminal; relay that rather than working around it.
 |------|--------|
 | `--force` | Rebuild and reinstall even when the installed version is already current. |
 | `--skip-build` | Reuse the `.deb` already sitting in the project root. |
+| `--no-fork-sync` | Skip step 7 entirely. |
+| `--fork-remote NAME` | Git remote of our fork. Default `fork`, or `$CLAUDE_FORK_REMOTE`. |
 | `--dry-run` | Print every step, change nothing. Good for showing the user the plan. |
 
 ## Notes
 
+- **The fork sync only ever pushes to a fork, and never with `--force`.** This
+  clone carries a remote for the project we forked (`origin` →
+  `aaddrick/claude-desktop-debian`); a publish script that pushed there would
+  rewrite someone else's repository. So step 7 refuses to run unless the target
+  remote (a) is not `origin`, (b) does not resolve to the same `owner/repo` as
+  `origin` under a different remote name, and (c) reports `isFork: true` to `gh`.
+  A rejected push means our fork's branch has commits upstream lacks — that is a
+  human's call to reconcile, so the script reports it and stops rather than
+  force-pushing. Step 7 is non-fatal: the package is already installed by then.
 - **The repo stays clean.** `build.sh` always builds from the `OFFICIAL_DEB_*`
   pins in `scripts/setup/official-deb.sh`, which lag upstream until CI's
   `check-claude-version` bumps them. Rather than edit that tracked file, this
